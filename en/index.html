@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chunk Walk</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --ghost: #6a6a6a;
+    --dim: #2e2e2e;
+    --faint: #1c1c1c;
+    --size: clamp(44px, 9vw, 132px);
+    --row: 1.25em;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    /* Helvetica Neue Light: its stem (0.063em at 9vw) is the closest Helvetica weight to
+       the Korean demo's Protoform Light stroke (0.037em at 13vw) */
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; font-weight: 300;
+    font-size: var(--size); line-height: var(--row);
+    -webkit-font-smoothing: antialiased; user-select: none; cursor: default;
+  }
+  #line { position: relative; display: inline-flex; height: var(--row); white-space: nowrap; }
+
+  /* placed chunks */
+  .chunk { position: relative; display: inline-block; margin-right: 0.14em; transition: margin 400ms ease; }
+  .chunk::after {
+    content: ""; position: absolute; left: 0.04em; right: 0.04em; bottom: 0.12em;
+    height: 1px; background: var(--dim); transition: opacity 400ms ease;
+  }
+  .chunk.new { animation: in 220ms ease-out; }
+  @keyframes in { from { opacity: 0; transform: translateX(-0.08em); } }
+  /* split digraphs (a_e): the e is carried along and lands after the next chunk */
+  .split { color: var(--dim); }
+  .moved { color: #b4b4b4; }
+  /* the waiting e stays on the word's line, just after the selected candidate */
+  #carry { position: absolute; top: 0; left: 100%; color: var(--fg); pointer-events: none; transition: transform 140ms ease; }
+  .gap { visibility: hidden; }
+  .done .chunk { margin-right: 0; }
+  .done .chunk::after { opacity: 0; }
+  .done .moved { color: inherit; transition: color 400ms ease; }
+
+  /* the bag of possible next chunks: a looping column filling the screen height,
+     the selected one sits on the word's line */
+  #bag { position: absolute; left: 100%; top: 0; list-style: none; margin: 0; padding: 0; }
+  #bag.scrolling { transition: transform 140ms ease; }
+  #bag li { height: var(--row); }
+  #bag.shuffling li { animation: shuffle 200ms ease-out; }
+  @keyframes shuffle { from { opacity: 0; } }
+
+  /* optional info (i): phonemes under chunks, probabilities beside candidates */
+  .info { display: none; font-size: 0.16em; line-height: 1; letter-spacing: 0.04em; color: var(--ghost); }
+  /* below the descenders (g y p q) */
+  .chunk .info { position: absolute; left: 0.25em; top: calc(100% + var(--size) * 0.04); }
+  #bag .info { display: none; margin-left: 0.6em; vertical-align: middle; }
+  body.show-info .info, body.show-info #bag .info { display: inline-block; }
+
+  /* envelope (shift+E, not listed): width = units looked back, fall-off = how fast they fade.
+     Drag across the bars, or [ ] for width and , . for fall-off. */
+  #envelope {
+    position: fixed; left: 22px; bottom: 22px; display: none; padding: 10px 12px 9px;
+    font: 10px/1.3 "Helvetica Neue", Helvetica, Arial, sans-serif; letter-spacing: 0.08em; color: #555;
+    border: 1px solid #1c1c1c; cursor: crosshair; touch-action: none;
+  }
+  body.show-envelope #envelope { display: block; }
+  #envelope .bars { display: flex; align-items: flex-end; gap: 4px; height: 48px; margin-bottom: 7px; }
+  #envelope .bar { width: 12px; background: #3a3a3a; }
+  #envelope .bar.off { height: 1px !important; background: #1c1c1c; }
+  #envelope .bar.now { background: #777; }
+  #hint {
+    position: fixed; bottom: 22px; left: 0; right: 0; text-align: center;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 12px; line-height: 1; letter-spacing: 0.08em; color: #333; transition: opacity 600ms;
+  }
+  .in-switcher { display: none; }
+  body.switcher .in-switcher { display: inline; }
+  body.started #hint { opacity: 0; }
+  body.started.show-hint #hint { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="line"><span id="word"></span><ul id="bag"></ul><span id="carry"></span></div>
+<div id="envelope"><div class="bars"></div><div class="text"></div></div>
+<div id="hint">space new word &nbsp;·&nbsp; → place &nbsp;·&nbsp; e end &nbsp;·&nbsp; ← undo &nbsp;·&nbsp; ↑ ↓ choose &nbsp;·&nbsp; s shuffle &nbsp;·&nbsp; enter say &nbsp;·&nbsp; i info &nbsp;·&nbsp; h keys<span class="in-switcher"> &nbsp;·&nbsp; tab en / kr</span></div>
+
+<script src="model.js"></script>
+<script src="sam.min.js"></script>
+<script>
+const M = window.WALK_MODEL;
+const S = M.settings;
+const START = M.units.indexOf("START"), END = M.units.indexOf("END");
+const BAG_SIZE = 20;
+
+const letters = u => M.units[u].split("|")[0];
+const phonemes = u => (M.units[u].split("|")[1] || "").replace("_", " ");
+
+function table(packed) {
+  const t = new Map();
+  for (let i = 0; i < packed.length; i += 2) t.set(packed[i], packed[i + 1]);
+  return t;
+}
+function normalise(t) {
+  let total = 0;
+  for (const v of t.values()) total += v;
+  const out = new Map();
+  for (const [k, v] of t) out.set(k, v / total);
+  return out;
+}
+
+// The envelope: how far back the next unit looks, and how fast that influence fades.
+// The unit d steps back gets influence falloff^(d-1), d = 1..width. The tables for the last
+// k units are blended with weight falloff^(k-1) - falloff^k (the last table, k = width, gets
+// falloff^(width-1)), so each unit's total influence is its envelope value. Width 2 with
+// falloff = memory is the rule in steps/10_walks/run.py WalkModel.next_probabilities + walk().
+const env = { width: 2, falloff: S.memory };
+try {
+  const saved = JSON.parse(localStorage.getItem("envelope:" + location.pathname));
+  if (saved && saved.width >= 1 && saved.width <= M.max_width && saved.falloff >= 0 && saved.falloff <= 1) Object.assign(env, saved);
+} catch (e) {}
+
+function contextKey(chain, k) {
+  const ids = [];
+  for (let i = chain.length - k; i < chain.length; i++) ids.push(i >= 0 ? chain[i] : -1);
+  return ids.join(",");
+}
+
+function nextProbabilities(chain) {
+  const mixed = new Map();
+  let shorter = null;
+  for (let k = 1; k <= env.width; k++) {
+    const t = M.orders[k][contextKey(chain, k)];
+    const pk = t ? normalise(table(t)) : shorter;  // unseen context: fall back to the shorter one
+    shorter = pk;
+    const w = env.falloff ** (k - 1) - (k < env.width ? env.falloff ** k : 0);
+    if (!pk || w <= 0) continue;
+    for (const [c, v] of pk) mixed.set(c, (mixed.get(c) || 0) + w * v);
+  }
+  if (!mixed.size) for (const [c, v] of shorter) mixed.set(c, v);  // falloff 1 with an unseen longest context
+  let p = new Map();
+  for (const [c, m] of mixed) if (m > 0) p.set(c, m ** (1 / S.temperature));
+  p = normalise(p);
+
+  const nUnits = chain.filter(u => u !== START).length;
+  if (p.has(END) && nUnits < S.min_units && p.size > 1) { p.delete(END); p = normalise(p); }
+  if (p.has(END) && nUnits > S.soft_length) {
+    p.set(END, p.get(END) * Math.exp(S.end_pressure * (nUnits - S.soft_length)));
+    p = normalise(p);
+  }
+  if (nUnits >= S.max_units) {
+    if (p.has(END)) return new Map([[END, 1]]);
+    const endShare = c => { const t = table(M.orders[1][c] || []); let s = 0; for (const v of t.values()) s += v; return (t.get(END) || 0) / (s || 1); };
+    return new Map([[[...p.keys()].reduce((a, b) => endShare(b) > endShare(a) ? b : a), 1]]);
+  }
+  return p;
+}
+
+// Weighted draw without replacement; the first draw is what a plain random walk would take.
+// END is always in the bag (last, if it was not drawn), even where the model gives it 0%.
+function drawBag(p, avoid = new Set()) {
+  let pool = [...p].filter(([c]) => !avoid.has(c));
+  if (pool.length < BAG_SIZE) pool = [...p];  // not enough unseen ones: redraw from everything
+  const bag = [];
+  while (bag.length < BAG_SIZE && pool.length) {
+    let r = Math.random() * pool.reduce((s, [, w]) => s + w, 0);
+    let i = 0;
+    while (i < pool.length - 1 && (r -= pool[i][1]) > 0) i++;
+    bag.push(pool[i][0]);
+    pool.splice(i, 1);
+  }
+  if (!bag.includes(END)) bag.push(END);
+  return bag;
+}
+
+// state: chain of unit ids starting at START; one bag (and selection) per open step
+let chain = null, steps = [];
+const done = () => chain && chain[chain.length - 1] === END;
+
+function openStep() {
+  const p = nextProbabilities(chain);
+  const bag = drawBag(p);
+  steps.push({ p, bag: chain.length > 1 ? bag : bag.filter(u => u !== END), sel: 0 });  // no empty words
+}
+
+function newWord() {
+  chain = [START];
+  steps = [];
+  openStep();
+  render();
+}
+
+// e: end the word here, whatever is selected
+function endWord() {
+  if (!chain || done() || chain.length < 2) return;
+  chain.push(END);
+  render(true);
+}
+
+function place() {
+  if (!chain || done()) return;
+  const step = steps[steps.length - 1];
+  chain.push(step.bag[step.sel]);
+  if (!done()) openStep();
+  render(true);
+}
+
+function undo() {
+  if (!chain || chain.length <= 1) return;
+  if (!done()) steps.pop();
+  chain.pop();
+  render();
+}
+
+function move(d) {
+  if (!chain || done()) return;
+  const step = steps[steps.length - 1];
+  const n = step.bag.length;
+  step.sel = (step.sel + d + n) % n;
+  render(false, false, d);
+}
+
+const envelopeBox = document.getElementById("envelope");
+
+function drawEnvelope() {
+  // furthest back on the left, the unit just placed on the right
+  const bars = [];
+  for (let d = M.max_width; d >= 1; d--)
+    bars.push(`<div class="bar${d > env.width ? " off" : d === 1 ? " now" : ""}" style="height: ${Math.max(1, 48 * env.falloff ** (d - 1))}px"></div>`);
+  envelopeBox.querySelector(".bars").innerHTML = bars.join("");
+  envelopeBox.querySelector(".text").textContent = `envelope  ·  width ${env.width}  ·  fall-off ${env.falloff.toFixed(2)}`;
+}
+
+function setEnvelope(width, falloff) {
+  env.width = Math.min(M.max_width, Math.max(1, Math.round(width)));
+  env.falloff = Math.min(1, Math.max(0, Math.round(falloff * 100) / 100));
+  try { localStorage.setItem("envelope:" + location.pathname, JSON.stringify(env)); } catch (e) {}
+  drawEnvelope();
+  // the open step is redrawn under the new envelope; placed units stay
+  if (chain && !done()) {
+    const step = steps[steps.length - 1];
+    step.p = nextProbabilities(chain);
+    step.bag = drawBag(step.p);
+    step.sel = 0;
+    render(false, true);
+  }
+}
+
+function dragEnvelope(e) {
+  const r = envelopeBox.querySelector(".bars").getBoundingClientRect();
+  const slot = Math.floor((e.clientX - r.left) / (r.width / M.max_width));  // 0 = furthest back
+  setEnvelope(M.max_width - Math.min(M.max_width - 1, Math.max(0, slot)), 1 - (e.clientY - r.top) / r.height);
+}
+envelopeBox.addEventListener("pointerdown", e => { envelopeBox.setPointerCapture(e.pointerId); dragEnvelope(e); });
+envelopeBox.addEventListener("pointermove", e => { if (envelopeBox.hasPointerCapture(e.pointerId)) dragEnvelope(e); });
+drawEnvelope();
+
+function shuffle() {
+  if (!chain || done()) return;
+  const step = steps[steps.length - 1];
+  step.bag = drawBag(step.p, new Set(step.bag)).filter(u => chain.length > 1 || u !== END);
+  step.sel = 0;
+  render(false, true);
+}
+
+// Spelling as in run.py spell(): a split digraph a_e puts its a in place and carries its e
+// until after the next unit (c a_e k -> c|a|ke). Each chunk gets the e it receives
+// (`before` for a split chunk, `after` otherwise); `carried` is an e still waiting.
+function layout(units) {
+  let carried = "";
+  const chunks = units.map(u => {
+    const part = letters(u);
+    if (part.includes("_")) {
+      const [a, e] = part.split("_");
+      const chunk = { before: carried, main: a, after: "" };
+      carried = e;
+      return chunk;
+    }
+    const chunk = { before: "", main: part, after: carried };
+    carried = "";
+    return chunk;
+  });
+  return { chunks, carried };
+}
+
+const word = document.getElementById("word");
+const bag = document.getElementById("bag");
+const line = document.getElementById("line");
+const carry = document.getElementById("carry");
+
+const moved = s => s ? `<span class="moved">${s}</span>` : "";
+
+// A candidate in the bag. A waiting e goes after an ordinary chunk but before a split one
+// (or the end), so the selected one leaves a gap for it there.
+function candidateHTML(u, gap) {
+  const space = gap ? `<span class="gap">${gap}</span>` : "";
+  if (u === END) return space + ".";
+  const part = letters(u);
+  if (!part.includes("_")) return `<span class="main">${part}</span>`;
+  const [a, e] = part.split("_");
+  return space + `${a}<span class="split">…${e}</span>`;
+}
+
+function render(justPlaced = false, shuffled = false, scrolled = 0) {
+  const units = chain ? chain.filter(u => u !== START && u !== END) : [];
+  const finished = done();
+  const { chunks, carried } = layout(units);
+  if (finished && chunks.length) chunks[chunks.length - 1].after += carried;
+  line.classList.toggle("done", finished);
+
+  word.innerHTML = chunks.map((c, i) =>
+    `<span class="chunk${justPlaced && i === units.length - 1 && !finished ? " new" : ""}">` +
+    moved(c.before) + c.main + moved(c.after) +
+    `<span class="info">${phonemes(units[i])}</span></span>`).join("") +
+    (finished ? `<span class="period">.</span>` : "");  // an ended word gets its full stop
+
+  if (!chain || finished) { bag.innerHTML = carry.textContent = ""; return; }
+  const step = steps[steps.length - 1];
+  const n = step.bag.length;
+  const rowPx = bag.parentElement.offsetHeight;
+  const reach = n === 1 ? 0 : Math.ceil(innerHeight / 2 / rowPx) + 1;  // rows above and below the line
+  const rows = [];
+  for (let o = -reach; o <= reach; o++) {
+    const u = step.bag[(((step.sel + o) % n) + n) % n];
+    const alpha = o === 0 ? 0.42 : 0.03 + 0.22 * (1 - Math.abs(o) / (reach + 1)) ** 1.6;
+    const info = u === END ? "end" : phonemes(u);
+    rows.push(`<li style="color: rgba(255,255,255,${alpha.toFixed(3)})">${candidateHTML(u, o === 0 && carried)}` +
+      `<span class="info">${info} &nbsp;${((step.p.get(u) || 0) * 100).toFixed(1)}%</span></li>`);
+  }
+  bag.innerHTML = rows.join("");
+  const main = bag.children[reach].querySelector(".main");
+  carry.textContent = carried;
+  carry.style.transform = `translateX(${main ? main.offsetWidth : 0}px)`;
+  // start where the previous selection was, then glide to the new one
+  bag.classList.remove("scrolling", "shuffling");
+  bag.style.transform = `translateY(${(-reach + scrolled) * rowPx}px)`;
+  if (scrolled) {
+    void bag.offsetWidth;
+    bag.classList.add("scrolling");
+    bag.style.transform = `translateY(${-reach * rowPx}px)`;
+  }
+  if (shuffled) { void bag.offsetWidth; bag.classList.add("shuffling"); }
+}
+
+// SAM (Software Automatic Mouth, 1982) says the chunks' phonemes, not the spelling, the way
+// the Korean walk's spelling is read by rule. SAM's alphabet is ARPAbet apart from these three;
+// it wants a stress digit, so the first vowel gets SAM's ordinary stress.
+const SAM_NAMES = { HH: "/H", NG: "NX", JH: "J" };
+const VOWEL = /^(AA|AE|AH|AO|AW|AY|EH|ER|EY|IH|IY|OW|OY|UH|UW)$/;
+const sam = window.SamJs && new SamJs({ phonetic: true, speed: 72, pitch: 64, throat: 128, mouth: 128 });
+let saying = null;
+
+function samPhonemes(units) {
+  let stressed = false;
+  return units.flatMap(u => (M.units[u].split("|")[1] || "").split("_").filter(Boolean))
+    .map(p => (SAM_NAMES[p] || p) + (!stressed && VOWEL.test(p) ? (stressed = true, "4") : ""))
+    .join(" ");
+}
+
+function speak() {
+  if (!done() || !sam) return;
+  if (saying) saying.abort("again");
+  const text = samPhonemes(chain.filter(u => u !== START && u !== END));
+  if (!text) return;
+  saying = sam.speak(text);
+  saying.catch(() => {});
+}
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  document.body.classList.add("started");  // the key list fades after the first key
+  if (e.key === "E") { e.preventDefault(); document.body.classList.toggle("show-envelope"); return; }
+  const nudge = { "[": [-1, 0], "]": [1, 0], ",": [0, -0.05], ".": [0, 0.05] }[e.key];
+  if (nudge && document.body.classList.contains("show-envelope")) {
+    e.preventDefault();
+    setEnvelope(env.width + nudge[0], env.falloff + nudge[1]);
+    return;
+  }
+  const actions = {
+    " ": newWord, ArrowRight: place, ArrowLeft: undo, e: endWord,
+    ArrowUp: () => move(-1), ArrowDown: () => move(1),
+    s: shuffle, Enter: speak, p: speak, i: () => document.body.classList.toggle("show-info"),
+    h: () => document.body.classList.toggle("show-hint"),
+  };
+  const action = actions[e.key];
+  if (action) { e.preventDefault(); action(); }
+  // inside ../walk/index.html, tab switches between the English and Korean walks
+  if (e.key === "Tab" && window.parent !== window) { e.preventDefault(); window.parent.postMessage("switch-language", "*"); }
+});
+addEventListener("resize", () => render());
+newWord();  // there is always a word
+if (window.parent !== window) document.body.classList.add("switcher");
+document.fonts.ready.then(() => render());  // the carried e is placed by measuring letters
+</script>
+</body>
+</html>
